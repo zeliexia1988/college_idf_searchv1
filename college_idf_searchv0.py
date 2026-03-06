@@ -12,12 +12,12 @@ st.set_page_config(page_title="法国中学智能选择系统", layout="wide")
 @st.cache_data
 def get_coords(address):
     try:
-        geolocator = Nominatim(user_agent="france_college_v12_full")
+        geolocator = Nominatim(user_agent="france_college_v13_tooltip")
         loc = geolocator.geocode(address + ", France", timeout=10)
         return (loc.latitude, loc.longitude) if loc else (48.8566, 2.3522)
     except: return (48.8566, 2.3522)
 
-# --- 3. 数据处理核心逻辑 (多表联动+多语种分类) ---
+# --- 3. 数据处理核心逻辑 ---
 @st.cache_data
 def load_all_data():
     file_main = "fr-en-college-idf-language.xlsx"
@@ -28,7 +28,6 @@ def load_all_data():
         return None
 
     try:
-        # A. 加载主表
         df_raw = pd.read_excel(file_main, engine='openpyxl')
         df_raw.columns = [str(c).strip() for c in df_raw.columns]
         
@@ -43,11 +42,13 @@ def load_all_data():
         c_ens = find_c(['enseignement'], df_raw)
         c_lang = find_c(['langue'], df_raw)
         c_sect = find_c(['secteur'], df_raw)
+        c_comm = find_c(['commune'], df_raw)
+        c_addr = find_c(['adresse'], df_raw)
 
-        # 提取基础信息
-        base = df_raw[[c_uai, c_name, c_sect, c_ips, 'Latitude', 'Longitude', 'Adresse', 'Commune']].drop_duplicates(subset=[c_uai])
+        # 基础信息聚合
+        base = df_raw[[c_uai, c_name, c_sect, c_ips, 'Latitude', 'Longitude', c_addr, c_comm]].drop_duplicates(subset=[c_uai])
         
-        # --- 核心回归：分类提取 LV1, LV2, LCA ---
+        # 分类提取语种逻辑
         def get_lang_subset(key):
             subset = df_raw[df_raw[c_ens].astype(str).str.contains(key, case=False, na=False)]
             return subset.groupby(c_uai)[c_lang].apply(lambda x: list(set(x.astype(str).str.upper()))).reset_index()
@@ -56,7 +57,7 @@ def load_all_data():
         df = df.merge(get_lang_subset('LV2'), on=c_uai, how='left').rename(columns={c_lang: 'lv2_list'})
         df = df.merge(get_lang_subset('LCA'), on=c_uai, how='left').rename(columns={c_lang: 'lca_list'})
 
-        # B. 关联国际部文件
+        # 关联国际部文件
         if os.path.exists(file_sec):
             df_sec = pd.read_excel(file_sec, engine='openpyxl')
             df_sec.columns = [str(c).strip() for c in df_sec.columns]
@@ -67,106 +68,100 @@ def load_all_data():
             df = df.merge(sec_agg, left_on=c_uai, right_on=s_uai, how='left')
             df['Section_Int'] = df[s_type].fillna("无 (Non)")
         else:
-            df['Section_Int'] = "数据文件未上传"
+            df['Section_Int'] = "数据文件缺失"
 
-        # C. 清洗与转换
+        # 清洗数据
         df['final_ips'] = pd.to_numeric(df[c_ips].astype(str).str.replace(',', '.'), errors='coerce').fillna(0)
         df['marker_color'] = df[c_sect].apply(lambda x: [0, 180, 0, 160] if 'PU' in str(x).upper() else [230, 0, 0, 160])
-        
-        # 菜单准备 (将空值转为空列表防止后续报错)
         for col in ['lv1_list', 'lv2_list', 'lca_list']:
             df[col] = df[col].apply(lambda x: x if isinstance(x, list) else [])
 
-        menus = {
-            'lv1': sorted(list(set([l for sub in df['lv1_list'] for l in sub]))),
-            'lv2': sorted(list(set([l for sub in df['lv2_list'] for l in sub]))),
-            'lca': sorted(list(set([l for sub in df['lca_list'] for l in sub]))),
-            'sec': sorted(df['Section_Int'].unique().tolist())
-        }
-        
-        df.attrs['config'] = {'name': c_name, 'sect': c_sect, 'uai': c_uai}
-        df.attrs['menus'] = menus
+        # 记录关键列名供 UI 使用
+        df.attrs['config'] = {'name': c_name, 'sect': c_sect, 'uai': c_uai, 'addr': c_addr, 'comm': c_comm}
         return df.dropna(subset=['Latitude', 'Longitude'])
     except Exception as e:
         st.error(f"❌ 初始化失败: {e}")
         return None
 
-# --- 4. 侧边栏 ---
+# --- 4. 界面与筛选 ---
 df = load_all_data()
 
 if df is not None:
+    c_cfg = df.attrs['config']
     with st.sidebar:
-        st.header("📍 位置与半径")
-        u_addr = st.text_input("搜索中心", "Paris")
+        st.header("📍 位置控制")
+        u_addr = st.text_input("中心地址", "Paris")
         h_coords = get_coords(u_addr)
         radius = st.slider("半径 (km)", 1, 50, 10)
         
-        st.header("🎯 课程精准筛选")
-        m = df.attrs['menus']
-        # 语言一、二、三回归
-        sel_lv1 = st.selectbox("语言一 (LV1 - 必选)", m['lv1'], index=m['lv1'].index("ANGLAIS") if "ANGLAIS" in m['lv1'] else 0)
-        sel_lv2 = st.selectbox("语言二 (LV2 - 选填)", ["全部 (Tous)"] + m['lv2'])
-        sel_lca = st.selectbox("语言三 (LCA - 选填)", ["全部 (Tous)"] + m['lca'])
+        st.header("🎯 课程筛选")
+        lv1_opts = sorted(list(set([l for sub in df['lv1_list'] for l in sub])))
+        sel_lv1 = st.selectbox("语言一 (LV1)", lv1_opts, index=lv1_opts.index("ANGLAIS") if "ANGLAIS" in lv1_opts else 0)
         
-        st.markdown("---")
-        # 国际部筛选
-        sel_sec = st.selectbox("国际部 (Section International)", ["全部"] + m['sec'])
+        lv2_opts = sorted(list(set([l for sub in df['lv2_list'] for l in sub])))
+        sel_lv2 = st.selectbox("语言二 (LV2)", ["全部"] + lv2_opts)
+        
+        lca_opts = sorted(list(set([l for sub in df['lca_list'] for l in sub])))
+        sel_lca = st.selectbox("语言三 (LCA)", ["全部"] + lca_opts)
 
-        st.header("📊 IPS 指标")
-        ips_range = st.slider("IPS 范围", 80.0, 160.0, (100.0, 150.0))
+        sec_opts = sorted(df['Section_Int'].unique().tolist())
+        sel_sec = st.selectbox("国际部 (Section International)", ["全部"] + sec_opts)
 
-    # --- 执行筛选 ---
+        st.header("📊 IPS 评分")
+        ips_range = st.slider("范围", 80.0, 160.0, (100.0, 150.0))
+
+    # 执行筛选
     df['dist'] = df.apply(lambda r: geodesic(h_coords, (r['Latitude'], r['Longitude'])).km, axis=1)
-    
-    # 基础筛选 (距离+IPS)
     mask = (df['dist'] <= radius) & (df['final_ips'].between(ips_range[0], ips_range[1]))
-    
-    # 语言一 (LV1)
     mask &= df['lv1_list'].apply(lambda x: sel_lv1 in x)
+    if sel_lv2 != "全部": mask &= df['lv2_list'].apply(lambda x: sel_lv2 in x)
+    if sel_lca != "全部": mask &= df['lca_list'].apply(lambda x: sel_lca in x)
+    if sel_sec != "全部": mask &= (df['Section_Int'] == sel_sec)
     
-    # 语言二 (LV2)
-    if sel_lv2 != "全部 (Tous)":
-        mask &= df['lv2_list'].apply(lambda x: sel_lv2 in x)
-        
-    # 语言三 (LCA)
-    if sel_lca != "全部 (Tous)":
-        mask &= df['lca_list'].apply(lambda x: sel_lca in x)
-        
-    # 国际部
-    if sel_sec != "全部":
-        mask &= (df['Section_Int'] == sel_sec)
-
     res = df[mask].sort_values("dist").copy()
 
-    # --- 5. 渲染页面 ---
-    st.title("🏫 法国中学智能选择系统 (全功能版)")
-    st.info(f"找到符合条件的学校：{len(res)} 所")
+    # --- 5. 渲染地图 (Tooltip 增强版) ---
+    st.title("🏫 法国中学智能选择系统")
+    st.subheader("🗺️ 空间分布 (鼠标悬停查看详情)")
 
-    # 地图
+    # 准备地图展示用的列
+    tooltip_config = {
+        "html": f"""
+            <b>学校名称:</b> {{{c_cfg['name']}}} <br/>
+            <b>地址:</b> {{{c_cfg['addr']}}} <br/>
+            <b>城市:</b> {{{c_cfg['comm']}}} <br/>
+            <b>国际部:</b> {{Section_Int}} <br/>
+            <b>IPS:</b> {{final_ips}}
+        """,
+        "style": {
+            "backgroundColor": "steelblue",
+            "color": "white",
+            "fontSize": "14px",
+            "zIndex": "1000"
+        }
+    }
+
     st.pydeck_chart(pdk.Deck(
         map_style=None,
         initial_view_state=pdk.ViewState(latitude=h_coords[0], longitude=h_coords[1], zoom=11),
         layers=[
-            pdk.Layer("ScatterplotLayer", res, get_position=["Longitude", "Latitude"], get_color="marker_color", get_radius=200, pickable=True),
-            pdk.Layer("ScatterplotLayer", pd.DataFrame([{"ln": h_coords[1], "lt": h_coords[0]}]), get_position=["ln", "lt"], get_color=[0, 100, 255], get_radius=400)
+            pdk.Layer("ScatterplotLayer", res, get_position=["Longitude", "Latitude"], 
+                      get_color="marker_color", get_radius=220, pickable=True),
+            pdk.Layer("ScatterplotLayer", pd.DataFrame([{"ln": h_coords[1], "lt": h_coords[0]}]), 
+                      get_position=["ln", "lt"], get_color=[0, 100, 255], get_radius=400)
         ],
-        tooltip={"text": "{Libellé}\nLV1: {lv1_str}\nLV2: {lv2_str}\n国际部: {Section_Int}"}
+        tooltip=tooltip_config
     ))
 
-    # 结果清单
+    # 6. 表格显示
     st.markdown("---")
-    res['lv1_str'] = res['lv1_list'].apply(lambda x: ", ".join(x))
-    res['lv2_str'] = res['lv2_list'].apply(lambda x: ", ".join(x))
-    res['lca_str'] = res['lca_list'].apply(lambda x: ", ".join(x))
+    res['LV1'] = res['lv1_list'].apply(lambda x: ", ".join(x))
+    res['LV2'] = res['lv2_list'].apply(lambda x: ", ".join(x))
+    res['LCA'] = res['lca_list'].apply(lambda x: ", ".join(x))
     
-    c = df.attrs['config']
-    disp = [c['name'], 'final_ips', 'dist', 'lv1_str', 'lv2_str', 'lca_str', 'Section_Int', 'Adresse']
-    
-    st.dataframe(
-        res[disp].rename(columns={c['name']: '学校名称', 'final_ips': 'IPS', 'dist': '距离(km)', 'lv1_str': 'LV1', 'lv2_str': 'LV2', 'lca_str': 'LCA', 'Section_Int': '国际部'}),
-        use_container_width=True, hide_index=True
-    )
-
+    final_disp = [c_cfg['name'], 'final_ips', 'dist', 'LV1', 'LV2', 'LCA', 'Section_Int', c_cfg['addr']]
+    st.dataframe(res[final_disp].rename(columns={c_cfg['name']: '学校', 'final_ips': 'IPS', 'dist': '距离(km)', 'Section_Int': '国际部'}), 
+                 use_container_width=True, hide_index=True)
 
 
 
