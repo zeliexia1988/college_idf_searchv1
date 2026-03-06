@@ -6,184 +6,141 @@ import pydeck as pdk
 import os
 
 # --- 1. 页面配置 ---
-st.set_page_config(page_title="法国中学智能选择系统", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="法国中学智能选择系统", layout="wide")
 
-# --- 2. 地理编码函数 ---
+# --- 2. 地理编码 ---
 @st.cache_data
-def get_coords_from_address(address):
+def get_coords(address):
     try:
-        # 增加 timeout 提高成功率
-        geolocator = Nominatim(user_agent="france_college_locator_v9")
-        location = geolocator.geocode(address + ", France", timeout=10) 
-        if location: return (location.latitude, location.longitude)
+        geolocator = Nominatim(user_agent="france_college_v11")
+        loc = geolocator.geocode(address + ", France", timeout=10)
+        return (loc.latitude, loc.longitude) if loc else (48.8566, 2.3522)
+    except: return (48.8566, 2.3522)
+
+# --- 3. 数据处理核心逻辑 ---
+@st.cache_data
+def load_and_merge_data():
+    file_main = "fr-en-college-idf-language.xlsx"
+    file_sec = "fr-en-sections-internationales.xlsx"
+    
+    if not os.path.exists(file_main):
+        st.error(f"找不到主文件: {file_main}")
         return None
-    except Exception: return None
-
-# --- 3. 核心数据解析逻辑 ---
-@st.cache_data
-def load_and_pivot_data():
-    target_file = "fr-en-college-idf-language.xlsx"
-    if not os.path.exists(target_file):
-        files = [f for f in os.listdir('.') if f.endswith('.xlsx')]
-        if files: target_file = files[0]
-        else: return None
 
     try:
-        # 读取数据并清洗空格
-        df_raw = pd.read_excel(target_file, engine='openpyxl')
+        # A. 加载主表 (语言与基础信息)
+        df_raw = pd.read_excel(file_main, engine='openpyxl')
         df_raw.columns = [str(c).strip() for c in df_raw.columns]
         
-        # 自动识别列名逻辑 (增强容错)
-        def get_col(keys):
+        # 自动识别列名逻辑
+        def find_c(keys, d): 
             for k in keys:
-                for c in df_raw.columns:
+                for c in d.columns:
                     if k.lower() in c.lower(): return c
-            raise KeyError(f"未找到包含 {keys} 的列")
+            return None
 
-        c_ens = get_col(['enseignement'])
-        c_lang = get_col(['langue'])
-        c_name = get_col(['libellé', 'nom'])
-        c_ips = get_col(['ips'])
-        c_lat = get_col(['latitude'])
-        c_lon = get_col(['longitude'])
-        c_sect = get_col(['secteur'])
-        c_comm = get_col(['commune'])
-        c_addr = next((c for c in df_raw.columns if 'adresse' in c.lower()), c_comm)
+        c_uai = find_c(['uai'], df_raw)
+        c_name = find_c(['libellé'], df_raw)
+        c_ips = find_c(['ips'], df_raw)
+        c_ens = find_c(['enseignement'], df_raw)
+        c_lang = find_c(['langue'], df_raw)
+        c_sect = find_c(['secteur'], df_raw)
 
-        # 1. 提取学校基础信息
-        base_df = df_raw[[c_name, c_comm, c_sect, c_ips, c_lat, c_lon, c_addr]].drop_duplicates(subset=[c_name])
-        
-        # 2. 透视语种信息
-        def get_pivot(ens_key):
-            subset = df_raw[df_raw[c_ens].astype(str).str.contains(ens_key, case=False, na=False)]
-            return subset.groupby(c_name)[c_lang].apply(lambda x: list(set(x.astype(str).str.capitalize()))).reset_index()
+        # 聚合主表语种数据
+        base = df_raw[[c_uai, c_name, c_sect, c_ips, 'Latitude', 'Longitude', 'Adresse', 'Commune']].drop_duplicates(subset=[c_uai])
+        lv1 = df_raw[df_raw[c_ens].str.contains('LV1', na=False)].groupby(c_uai)[c_lang].apply(lambda x: list(set(x.astype(str).str.upper()))).reset_index()
+        lv2 = df_raw[df_raw[c_ens].str.contains('LV2', na=False)].groupby(c_uai)[c_lang].apply(lambda x: list(set(x.astype(str).str.upper()))).reset_index()
+        lca = df_raw[df_raw[c_ens].str.contains('LCA', na=False)].groupby(c_uai)[c_lang].apply(lambda x: list(set(x.astype(str).str.upper()))).reset_index()
 
-        lv1 = get_pivot("LV1")
-        lv2 = get_pivot("LV2")
-        lca = get_pivot("LCA")
+        df = base.merge(lv1, on=c_uai, how='left').rename(columns={c_lang: 'lv1'})
+        df = df.merge(lv2, on=c_uai, how='left').rename(columns={c_lang: 'lv2'})
+        df = df.merge(lca, on=c_uai, how='left').rename(columns={c_lang: 'lca'})
 
-        # 3. 合并到主表
-        df = base_df.merge(lv1, on=c_name, how='left').rename(columns={c_lang: 'lv1_list'})
-        df = df.merge(lv2, on=c_name, how='left').rename(columns={c_lang: 'lv2_list'})
-        df = df.merge(lca, on=c_name, how='left').rename(columns={c_lang: 'lca_list'})
+        # B. 关联国际部文件
+        if os.path.exists(file_sec):
+            df_sec = pd.read_excel(file_sec, engine='openpyxl')
+            df_sec.columns = [str(c).strip() for c in df_sec.columns]
+            
+            s_uai = find_c(['uai'], df_sec)
+            s_type = find_c(['section'], df_sec) # 匹配 "Section International"
+            
+            # 将同一学校的多个国际部语种合并显示
+            sec_agg = df_sec.groupby(s_uai)[s_type].apply(lambda x: ", ".join(set(x.astype(str)))).reset_index()
+            df = df.merge(sec_agg, left_on=c_uai, right_on=s_uai, how='left')
+            df['Section_Int'] = df[s_type].fillna("无 (Non)")
+        else:
+            df['Section_Int'] = "未找到数据文件"
 
-        # 填充空列表避免筛选报错
-        for col in ['lv1_list', 'lv2_list', 'lca_list']:
-            df[col] = df[col].apply(lambda x: x if isinstance(x, list) else [])
-
-        # 类型转换
-        df['final_lat'] = pd.to_numeric(df[c_lat], errors='coerce')
-        df['final_lon'] = pd.to_numeric(df[c_lon], errors='coerce')
+        # C. 数据清洗
         df['final_ips'] = pd.to_numeric(df[c_ips].astype(str).str.replace(',', '.'), errors='coerce').fillna(0)
+        df['marker_color'] = df[c_sect].apply(lambda x: [0, 180, 0, 160] if 'PU' in str(x).upper() else [230, 0, 0, 160])
         
-        # 提取下拉菜单列表
+        # 菜单准备
         menus = {
-            'lv1': sorted(list(set([l for sub in df['lv1_list'] for l in sub]))),
-            'lv2': sorted(list(set([l for sub in df['lv2_list'] for l in sub]))),
-            'lca': sorted(list(set([l for sub in df['lca_list'] for l in sub])))
+            'lv1': sorted(list(set([l for sub in df['lv1'].dropna() for l in sub]))),
+            'sec': sorted(df['Section_Int'].unique().tolist())
         }
-
-        # 设置地图点颜色
-        df['marker_color'] = df[c_sect].apply(lambda x: [0, 180, 0, 160] if 'public' in str(x).lower() else [230, 0, 0, 160])
         
-        df.attrs.update({'config': {'name': c_name, 'comm': c_comm, 'sect': c_sect, 'addr': c_addr}, 'menus': menus})
-        return df.dropna(subset=['final_lat', 'final_lon'])
+        df.attrs.update({'config': {'name': c_name, 'sect': c_sect, 'uai': c_uai}, 'menus': menus})
+        return df.dropna(subset=['Latitude', 'Longitude'])
     except Exception as e:
-        st.error(f"❌ 数据加载失败: {e}")
+        st.error(f"❌ 关联数据失败: {e}")
         return None
 
-# --- 4. 侧边栏交互 ---
-df = load_and_pivot_data()
+# --- 4. 界面与交互 ---
+df = load_and_merge_data()
 
-with st.sidebar:
-    st.header("📍 位置与半径")
-    addr_input = st.text_input("中心地址", "Paris")
-    home_coords = get_coords_from_address(addr_input) or (48.8566, 2.3522)
-    radius_km = st.slider("搜索半径 (km)", 1, 50, 10)
-
-    if df is not None:
-        st.markdown("---")
-        st.header("🎯 语种筛选")
-        m = df.attrs['menus']
-        sel_lv1 = st.selectbox("语言一 (LV1)", m['lv1'], index=m['lv1'].index("Anglais") if "Anglais" in m['lv1'] else 0)
-        sel_lv2 = st.selectbox("语言二 (LV2)", ["不限"] + m['lv2'])
-        sel_lca = st.selectbox("语言三 (LCA)", ["不限"] + m['lca'])
-
-        st.markdown("---")
-        st.header("📊 其他条件")
-        c = df.attrs['config']
-        all_sects = df[c['sect']].unique().tolist()
-        sel_sects = st.multiselect("学校性质", all_sects, default=all_sects)
-        ips_range = st.slider("IPS 评分", float(df['final_ips'].min()), float(df['final_ips'].max()), (float(df['final_ips'].min()), float(df['final_ips'].max())))
-
-# --- 5. 过滤逻辑 ---
 if df is not None:
-    c = df.attrs['config']
-    df['dist'] = df.apply(lambda r: geodesic(home_coords, (r['final_lat'], r['final_lon'])).km, axis=1)
-    
-    # 构建筛选遮罩
-    mask = (df['dist'] <= radius_km) & \
-           (df['final_ips'] >= ips_range[0]) & \
-           (df['final_ips'] <= ips_range[1]) & \
-           (df[c['sect']].isin(sel_sects))
-    
-    mask &= df['lv1_list'].apply(lambda x: sel_lv1 in x)
-    if sel_lv2 != "不限": mask &= df['lv2_list'].apply(lambda x: sel_lv2 in x)
-    if sel_lca != "不限": mask &= df['lca_list'].apply(lambda x: sel_lca in x)
-    
-    res = df[mask].sort_values("dist").copy()
+    with st.sidebar:
+        st.header("📍 位置与半径")
+        u_addr = st.text_input("中心地址", "Paris")
+        h_coords = get_coords(u_addr)
+        radius = st.slider("半径 (km)", 1, 50, 10)
+        
+        st.header("🎯 核心筛选")
+        m = df.attrs['menus']
+        # 1. 语言筛选
+        sel_lv1 = st.selectbox("第一外语 (LV1)", m['lv1'], index=m['lv1'].index("ANGLAIS") if "ANGLAIS" in m['lv1'] else 0)
+        # 2. 国际部筛选 (新加入)
+        sel_sec = st.selectbox("国际部类型 (Section International)", ["全部"] + m['sec'])
 
-    # --- 6. 页面展示 ---
-    st.title("🏫 法国中学智能选择系统")
-    
-    # A. 地图展示 (核心修复：使用不需要 Token 的底图)
-    st.subheader("🗺️ 地理分布图 (🔵家 🟢公立 🔴私立)")
-    
-    # 预处理显示文本
-    res['lv1_str'] = res['lv1_list'].apply(lambda x: ", ".join(x))
-    res['lv2_str'] = res['lv2_list'].apply(lambda x: ", ".join(x))
-    res['lca_str'] = res['lca_list'].apply(lambda x: ", ".join(x))
+        st.header("📊 IPS 评分")
+        ips_range = st.slider("IPS 范围", 80.0, 160.0, (100.0, 150.0))
 
-    view_state = pdk.ViewState(latitude=home_coords[0], longitude=home_coords[1], zoom=11)
+    # --- 筛选执行 ---
+    df['dist'] = df.apply(lambda r: geodesic(h_coords, (r['Latitude'], r['Longitude'])).km, axis=1)
     
-    school_layer = pdk.Layer(
-        "ScatterplotLayer", res,
-        get_position=["final_lon", "final_lat"],
-        get_color="marker_color",
-        get_radius=200,
-        pickable=True
-    )
+    mask = (df['dist'] <= radius) & (df['final_ips'].between(ips_range[0], ips_range[1]))
+    mask &= df['lv1'].apply(lambda x: sel_lv1 in x if isinstance(x, list) else False)
     
-    home_layer = pdk.Layer(
-        "ScatterplotLayer", pd.DataFrame([{"ln": home_coords[1], "lt": home_coords[0]}]),
-        get_position=["ln", "lt"],
-        get_color=[0, 100, 255, 255],
-        get_radius=400
-    )
+    if sel_sec != "全部":
+        mask &= (df['Section_Int'] == sel_sec)
 
-    # 关键点：map_style 使用简单的 carto 样式，避免白屏
+    res = df[mask].sort_values("dist")
+
+    # --- 5. 结果排版 ---
+    st.title("🏫 法国中学智能选择系统 v2.0")
+    st.markdown(f"找到满足条件的学校: **{len(res)}** 所")
+
+    # 地图
     st.pydeck_chart(pdk.Deck(
-        layers=[school_layer, home_layer],
-        initial_view_state=view_state,
-        map_style="light", # 备选："mapbox://styles/mapbox/light-v9" 但通常需要 token
-        tooltip={
-            "html": "<b>{"+c['name']+"}</b><br/>地址: {"+c['addr']+"}<br/>LV1: {lv1_str}<br/>LV2: {lv2_str}",
-            "style": {"color": "white"}
-        }
+        map_style=None,
+        initial_view_state=pdk.ViewState(latitude=h_coords[0], longitude=h_coords[1], zoom=11),
+        layers=[
+            pdk.Layer("ScatterplotLayer", res, get_position=["Longitude", "Latitude"], get_color="marker_color", get_radius=200, pickable=True),
+            pdk.Layer("ScatterplotLayer", pd.DataFrame([{"ln": h_coords[1], "lt": h_coords[0]}]), get_position=["ln", "lt"], get_color=[0, 100, 255], get_radius=400)
+        ],
+        tooltip={"text": "{Libellé}\n国际部: {Section_Int}\n地址: {Adresse}"}
     ))
 
-    # B. 结果表格
+    # 表格
     st.markdown("---")
-    st.subheader(f"📋 筛选清单 (共 {len(res)} 所)")
-    disp_cols = [c['name'], c['sect'], 'final_ips', 'dist', 'lv1_str', 'lv2_str', 'lca_str']
-    st.dataframe(
-        res[disp_cols].rename(columns={c['name']: '学校', c['sect']: '性质', 'final_ips': 'IPS', 'dist': '距离(km)'}),
-        use_container_width=True, hide_index=True, height=400
-    )
+    st.subheader("📋 详细信息清单")
+    res['LV1_List'] = res['lv1'].apply(lambda x: ", ".join(x) if isinstance(x, list) else "")
+    disp_cols = ['Libellé', 'Secteur', 'final_ips', 'dist', 'LV1_List', 'Section_Int', 'Adresse']
+    st.dataframe(res[disp_cols].rename(columns={'final_ips': 'IPS', 'dist': '距离(km)', 'Section_Int': '国际部'}), use_container_width=True, hide_index=True)
 
     if not res.empty:
-        st.download_button("📥 导出结果", res.to_csv(index=False).encode('utf-8-sig'), "results.csv")
-else:
-    st.info("请在 GitHub 仓库中确保包含数据文件并在侧边栏输入地址。")
+        st.download_button("📥 导出结果", res.to_csv(index=False).encode('utf-8-sig'), "college_results.csv")
 
 
