@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
+import pydeck as pdk 
 import os
 
 # --- 1. 页面配置 ---
@@ -11,7 +12,7 @@ st.set_page_config(page_title="法国中学智能选择系统", layout="wide")
 @st.cache_data
 def get_coords_from_address(address):
     try:
-        geolocator = Nominatim(user_agent="france_college_locator_v2")
+        geolocator = Nominatim(user_agent="france_college_locator_v5")
         location = geolocator.geocode(address + ", France") 
         if location:
             return (location.latitude, location.longitude)
@@ -19,7 +20,7 @@ def get_coords_from_address(address):
     except Exception:
         return None
 
-# --- 3. 增强型数据加载函数 ---
+# --- 3. 数据加载与预处理 ---
 @st.cache_data
 def load_data():
     target_file = "fr-en-college-idf-language.xlsx"
@@ -30,7 +31,6 @@ def load_data():
 
     try:
         df = pd.read_excel(target_file, engine='openpyxl')
-        # 清洗列名：去空格、换行符
         df.columns = [str(c).strip().replace('\n', '').replace('\r', '') for c in df.columns]
         
         def find_col(keywords):
@@ -39,18 +39,17 @@ def load_data():
                     return col
             return None
 
-        # --- 核心修改：明确指定 Libellé 为学校名称列 ---
         cols = {
             'ips': find_col(['IPS']),
             'secteur': find_col(['Secteur']),
             'lat': find_col(['Latitude']),
             'lon': find_col(['Longitude']),
             'lang': find_col(['Langues']),
-            'name': find_col(['Libellé']), # 优先匹配 Libellé
-            'commune': find_col(['Commune'])
+            'name': find_col(['Libellé']), 
+            'commune': find_col(['Commune']),
+            'adresse': find_col(['Adresse']) # 新增：匹配地址列
         }
 
-        # 数据预处理
         df['final_lat'] = pd.to_numeric(df[cols['lat']], errors='coerce')
         df['final_lon'] = pd.to_numeric(df[cols['lon']], errors='coerce')
         
@@ -59,6 +58,22 @@ def load_data():
         else:
             df['final_ips'] = 0
 
+        # 定义颜色逻辑
+        def assign_color(row):
+            secteur_val = str(row[cols['secteur']]).lower()
+            return [0, 180, 0, 180] if 'public' in secteur_val else [230, 0, 0, 180]
+
+        df['marker_color'] = df.apply(assign_color, axis=1)
+        
+        # --- 核心改进：提取所有不重复的语种用于下拉列表 ---
+        all_langs = set()
+        if cols['lang']:
+            # 假设语种以逗号或分号分隔，如 "Anglais, Chinois"
+            for val in df[cols['lang']].dropna().astype(str):
+                for l in val.replace(';', ',').split(','):
+                    all_langs.add(l.strip())
+        df.attrs['unique_langs'] = sorted(list(all_langs))
+        
         df.attrs['cols_config'] = cols
         return df.dropna(subset=['final_lat', 'final_lon'])
     except Exception as e:
@@ -67,18 +82,14 @@ def load_data():
 
 # --- 4. 侧边栏交互 ---
 st.sidebar.header("📍 1. 中心地址")
-address_str = st.sidebar.text_input("输入中心点 (地址、邮编或城市)", "Paris")
+address_str = st.sidebar.text_input("输入您的地址/家", "Paris")
 
 home_coords = get_coords_from_address(address_str)
-if home_coords:
-    st.sidebar.success(f"定位成功: {home_coords[0]:.4f}, {home_coords[1]:.4f}")
-else:
-    st.sidebar.warning("找不到该地址，已使用巴黎默认坐标")
+if not home_coords:
     home_coords = (48.8566, 2.3522)
 
 search_radius = st.sidebar.slider("搜索半径 (km)", 1, 50, 10)
 
-# --- 5. 数据处理 ---
 df_data = load_data()
 
 if df_data is not None:
@@ -86,20 +97,20 @@ if df_data is not None:
     
     st.sidebar.markdown("---")
     st.sidebar.header("🎯 2. 筛选过滤")
-
+    
     # 性质筛选
     all_secteurs = df_data[cfg['secteur']].unique().tolist() if cfg['secteur'] else []
     sel_secteurs = st.sidebar.multiselect("学校性质", all_secteurs, default=all_secteurs)
-
+    
     # IPS 筛选
-    min_v = float(df_data['final_ips'].min())
-    max_v = float(df_data['final_ips'].max())
+    min_v, max_v = float(df_data['final_ips'].min()), float(df_data['final_ips'].max())
     sel_ips = st.sidebar.slider("IPS 评分", min_v, max_v, (min_v, max_v))
 
-    # 语种搜索
-    search_lang = st.sidebar.text_input("🔍 搜语种 (如: Chinois)")
+    # --- 核心改进：语种筛选改为下拉表形式 ---
+    unique_langs = ["全部"] + df_data.attrs['unique_langs']
+    sel_lang = st.sidebar.selectbox("📖 选择教学语种", unique_langs)
 
-    # 距离计算
+    # 计算距离
     df_data['dist_km'] = df_data.apply(lambda r: geodesic(home_coords, (r['final_lat'], r['final_lon'])).km, axis=1)
 
     # 过滤逻辑
@@ -107,58 +118,73 @@ if df_data is not None:
            (df_data['final_ips'] >= sel_ips[0]) & \
            (df_data['final_ips'] <= sel_ips[1])
     
-    if sel_secteurs and cfg['secteur']:
-        mask = mask & (df_data[cfg['secteur']].isin(sel_secteurs))
+    if sel_secteurs:
+        mask &= df_data[cfg['secteur']].isin(sel_secteurs)
     
-    if search_lang and cfg['lang']:
-        mask = mask & (df_data[cfg['lang']].str.contains(search_lang, case=False, na=False))
+    if sel_lang != "全部" and cfg['lang']:
+        mask &= df_data[cfg['lang']].str.contains(sel_lang, case=False, na=False)
 
     df_filtered = df_data[mask].sort_values("dist_km")
 
-    # --- 6. 结果展示 ---
+    # --- 5. 展示界面 ---
     st.title("🏫 法国中学智能选择系统")
     
-    m1, m2, m3 = st.columns(3)
-    m1.metric("匹配学校", len(df_filtered))
-    m2.metric("当前中心", address_str)
-    if not df_filtered.empty:
-        m3.metric("最近距离", f"{df_filtered['dist_km'].min():.2f} km")
+    col_l, col_r = st.columns([3, 2])
 
-    st.markdown("---")
-    c_left, c_right = st.columns([3, 2])
-
-    with c_left:
-        st.subheader("📋 详细信息清单")
-        # --- 核心修改：在列表中排除 UAI，仅保留 Libellé ---
+    with col_l:
+        st.subheader("📋 筛选清单")
         disp_cols = [cfg['name'], cfg['commune'], cfg['secteur'], 'final_ips', 'dist_km', cfg['lang']]
         actual_disp = [c for c in disp_cols if c and c in df_filtered.columns]
         
-        # 重命名列名让表格更美观
-        rename_map = {
-            cfg['name']: '学校名称 (Libellé)',
-            cfg['commune']: '城市',
-            cfg['secteur']: '性质',
-            'final_ips': 'IPS 评分',
-            'dist_km': '距离 (km)',
-            cfg['lang']: '开课语种'
-        }
-        
+        # --- 核心改进：使用 hide_index=True 隐藏首列行数 ---
         st.dataframe(
-            df_filtered[actual_disp].rename(columns=rename_map),
-            use_container_width=True,
-            height=500
+            df_filtered[actual_disp].rename(columns={cfg['name']: '学校', 'final_ips': 'IPS', 'dist_km': '距离(km)'}),
+            use_container_width=True, 
+            height=550,
+            hide_index=True 
         )
 
-    with c_right:
-        st.subheader("🗺️ 地理分布图")
+    with col_r:
+        st.subheader("🗺️ 地理分布 (🔵家 🟢公立 🔴私立)")
         if not df_filtered.empty:
-            map_data = df_filtered.rename(columns={'final_lat': 'lat', 'final_lon': 'lon'})[['lat', 'lon']]
-            st.map(map_data)
+            school_layer = pdk.Layer(
+                "ScatterplotLayer",
+                df_filtered,
+                get_position=["final_lon", "final_lat"],
+                get_color="marker_color",
+                get_radius=180,
+                pickable=True,
+            )
+            
+            home_layer = pdk.Layer(
+                "ScatterplotLayer",
+                pd.DataFrame([{"lon": home_coords[1], "lat": home_coords[0]}]),
+                get_position=["lon", "lat"],
+                get_color=[0, 100, 255, 255],
+                get_radius=350,
+                pickable=False,
+            )
+            
+            # --- 核心改进：Tooltip 增加学校地址显示 ---
+            tooltip_content = {
+                "html": f"<b>学校:</b> {{{cfg['name']}}}<br/>"
+                        f"<b>地址:</b> {{{cfg['adresse']}}}<br/>" # 显示原始 Excel 中的地址
+                        f"<b>城市:</b> {{{cfg['commune']}}}<br/>"
+                        f"<b>距离:</b> {{dist_km:.2f}} km",
+                "style": {"color": "white"}
+            }
+            
+            st.pydeck_chart(pdk.Deck(
+                layers=[school_layer, home_layer],
+                initial_view_state=pdk.ViewState(latitude=home_coords[0], longitude=home_coords[1], zoom=11),
+                tooltip=tooltip_content
+            ))
         else:
-            st.info("该范围内没有符合条件的学校。")
+            st.info("无匹配结果。")
 
     if not df_filtered.empty:
         csv = df_filtered.to_csv(index=False).encode('utf-8-sig')
-        st.download_button("📥 下载结果 (CSV)", csv, "search_results.csv", "text/csv")
+        st.download_button("📥 下载结果", csv, "results.csv", "text/csv")
 else:
-    st.error("无法加载 Excel 数据，请检查文件名称和路径。")
+    st.error("数据加载失败。")
+
