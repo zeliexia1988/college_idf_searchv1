@@ -12,7 +12,7 @@ st.set_page_config(page_title="法国中学智能选择系统", layout="wide")
 @st.cache_data
 def get_coords_from_address(address):
     try:
-        geolocator = Nominatim(user_agent="france_college_locator_v5")
+        geolocator = Nominatim(user_agent="france_college_locator_v6")
         location = geolocator.geocode(address + ", France") 
         if location:
             return (location.latitude, location.longitude)
@@ -47,7 +47,7 @@ def load_data():
             'lang': find_col(['Langues']),
             'name': find_col(['Libellé']), 
             'commune': find_col(['Commune']),
-            'adresse': find_col(['Adresse']) # 新增：匹配地址列
+            'adresse': find_col(['Adresse'])
         }
 
         df['final_lat'] = pd.to_numeric(df[cols['lat']], errors='coerce')
@@ -58,22 +58,19 @@ def load_data():
         else:
             df['final_ips'] = 0
 
-        # 定义颜色逻辑
         def assign_color(row):
             secteur_val = str(row[cols['secteur']]).lower()
             return [0, 180, 0, 180] if 'public' in secteur_val else [230, 0, 0, 180]
 
         df['marker_color'] = df.apply(assign_color, axis=1)
         
-        # --- 核心改进：提取所有不重复的语种用于下拉列表 ---
+        # 提取唯一语种列表
         all_langs = set()
         if cols['lang']:
-            # 假设语种以逗号或分号分隔，如 "Anglais, Chinois"
             for val in df[cols['lang']].dropna().astype(str):
                 for l in val.replace(';', ',').split(','):
                     all_langs.add(l.strip())
         df.attrs['unique_langs'] = sorted(list(all_langs))
-        
         df.attrs['cols_config'] = cols
         return df.dropna(subset=['final_lat', 'final_lon'])
     except Exception as e:
@@ -94,26 +91,33 @@ df_data = load_data()
 
 if df_data is not None:
     cfg = df_data.attrs['cols_config']
+    unique_langs = df_data.attrs['unique_langs']
     
     st.sidebar.markdown("---")
     st.sidebar.header("🎯 2. 筛选过滤")
     
-    # 性质筛选
     all_secteurs = df_data[cfg['secteur']].unique().tolist() if cfg['secteur'] else []
     sel_secteurs = st.sidebar.multiselect("学校性质", all_secteurs, default=all_secteurs)
     
-    # IPS 筛选
     min_v, max_v = float(df_data['final_ips'].min()), float(df_data['final_ips'].max())
     sel_ips = st.sidebar.slider("IPS 评分", min_v, max_v, (min_v, max_v))
 
-    # --- 核心改进：语种筛选改为下拉表形式 ---
-    unique_langs = ["全部"] + df_data.attrs['unique_langs']
-    sel_lang = st.sidebar.selectbox("📖 选择教学语种", unique_langs)
+    # --- 核心改进：三语种筛选逻辑 ---
+    st.sidebar.subheader("📖 教学语种筛选")
+    
+    # 语言一：必填 (默认尝试匹配 Anglais)
+    default_lang1 = "Anglais" if "Anglais" in unique_langs else unique_langs[0]
+    lang1 = st.sidebar.selectbox("语言一 (必填)", unique_langs, index=unique_langs.index(default_lang1))
+    
+    # 语言二/三：可选
+    options_optional = ["无 (Optional)"] + unique_langs
+    lang2 = st.sidebar.selectbox("语言二 (选填)", options_optional, index=0)
+    lang3 = st.sidebar.selectbox("语言三 (选填)", options_optional, index=0)
 
     # 计算距离
     df_data['dist_km'] = df_data.apply(lambda r: geodesic(home_coords, (r['final_lat'], r['final_lon'])).km, axis=1)
 
-    # 过滤逻辑
+    # 基础过滤 (距离 + IPS + 性质)
     mask = (df_data['dist_km'] <= search_radius) & \
            (df_data['final_ips'] >= sel_ips[0]) & \
            (df_data['final_ips'] <= sel_ips[1])
@@ -121,8 +125,16 @@ if df_data is not None:
     if sel_secteurs:
         mask &= df_data[cfg['secteur']].isin(sel_secteurs)
     
-    if sel_lang != "全部" and cfg['lang']:
-        mask &= df_data[cfg['lang']].str.contains(sel_lang, case=False, na=False)
+    # --- 核心改进：执行多重语言筛选 (AND 逻辑) ---
+    if cfg['lang']:
+        # 必须满足语言一
+        mask &= df_data[cfg['lang']].str.contains(lang1, case=False, na=False)
+        # 如果选了语言二，则必须也满足
+        if lang2 != "无 (Optional)":
+            mask &= df_data[cfg['lang']].str.contains(lang2, case=False, na=False)
+        # 如果选了语言三，则必须也满足
+        if lang3 != "无 (Optional)":
+            mask &= df_data[cfg['lang']].str.contains(lang3, case=False, na=False)
 
     df_filtered = df_data[mask].sort_values("dist_km")
 
@@ -136,11 +148,10 @@ if df_data is not None:
         disp_cols = [cfg['name'], cfg['commune'], cfg['secteur'], 'final_ips', 'dist_km', cfg['lang']]
         actual_disp = [c for c in disp_cols if c and c in df_filtered.columns]
         
-        # --- 核心改进：使用 hide_index=True 隐藏首列行数 ---
         st.dataframe(
             df_filtered[actual_disp].rename(columns={cfg['name']: '学校', 'final_ips': 'IPS', 'dist_km': '距离(km)'}),
             use_container_width=True, 
-            height=550,
+            height=600,
             hide_index=True 
         )
 
@@ -165,10 +176,9 @@ if df_data is not None:
                 pickable=False,
             )
             
-            # --- 核心改进：Tooltip 增加学校地址显示 ---
             tooltip_content = {
                 "html": f"<b>学校:</b> {{{cfg['name']}}}<br/>"
-                        f"<b>地址:</b> {{{cfg['adresse']}}}<br/>" # 显示原始 Excel 中的地址
+                        f"<b>地址:</b> {{{cfg['adresse']}}}<br/>"
                         f"<b>城市:</b> {{{cfg['commune']}}}<br/>"
                         f"<b>距离:</b> {{dist_km:.2f}} km",
                 "style": {"color": "white"}
@@ -180,7 +190,7 @@ if df_data is not None:
                 tooltip=tooltip_content
             ))
         else:
-            st.info("无匹配结果。")
+            st.info("💡 没有学校同时满足这三种语言组合。请尝试减少选填语言或扩大半径。")
 
     if not df_filtered.empty:
         csv = df_filtered.to_csv(index=False).encode('utf-8-sig')
